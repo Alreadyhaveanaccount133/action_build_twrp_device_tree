@@ -3,18 +3,14 @@ name: Generate TWRP Device Tree
 on:
   workflow_dispatch:
     inputs:
-      LIBRARY_NAME:
-        description: 'Library name for the device tree'
-        required: true
-        default: 'Twrp_Device_Generator'
-      IMG_URL:
-        description: 'URL to recovery/boot/vendor_boot image'
-        required: true
-        default: 'https://github.com/momo54181/action_build_twrp_device_tree/raw/main/recovery.img'
       DEVICE_CODENAME:
         description: 'Device codename (e.g., beryl)'
         required: true
         default: 'beryl'
+      IMG_URL:
+        description: 'URL to vendor_boot.img or init_boot.img'
+        required: true
+        default: ''
 
 jobs:
   generate-device-tree:
@@ -29,22 +25,11 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          python3 \
-          python3-pip \
-          cpio \
-          wget \
-          zip \
-          unzip \
-          git \
-          file \
-          gzip \
-          lz4 \
-          xz-utils \
-          android-sdk-libsparse-utils
+          python3 python3-pip cpio wget zip unzip git file \
+          gzip lz4 xz-utils android-sdk-libsparse-utils
 
     - name: Install TWRP generator
-      run: |
-        pip3 install --upgrade twrpdtgen
+      run: pip3 install --upgrade twrpdtgen
 
     - name: Download image
       run: |
@@ -60,49 +45,105 @@ jobs:
     - name: Unpack, patch and repack image
       run: |
         cd aik
-        # 解包镜像
-        ./unpackimg.sh ../original.img
 
-        # 查找并修改 prop.default 或 build.prop
-        if [ -f ramdisk/prop.default ]; then
-          echo "ro.product.system.device=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/prop.default
-          echo "ro.product.system.model=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/prop.default
-          echo "ro.product.system.name=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/prop.default
-        elif [ -f ramdisk/build.prop ]; then
-          echo "ro.product.system.device=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/build.prop
-          echo "ro.product.system.model=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/build.prop
-          echo "ro.product.system.name=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/build.prop
-        else
-          echo "未找到 prop.default 或 build.prop，尝试查找所有 build.prop 文件..."
-          find ramdisk -name "build.prop" -o -name "prop.default" | while read f; do
-            echo "添加属性到 $f"
-            echo "ro.product.system.device=${{ github.event.inputs.DEVICE_CODENAME }}" >> "$f"
-            echo "ro.product.system.model=${{ github.event.inputs.DEVICE_CODENAME }}" >> "$f"
-            echo "ro.product.system.name=${{ github.event.inputs.DEVICE_CODENAME }}" >> "$f"
+        # 解包 (AIK 因 lz4 警告可能返回非 0，忽略)
+        sudo ./unpackimg.sh ../original.img || true
+
+        echo "=== Checking ramdisk ==="
+        if ! sudo test -d ramdisk; then
+          echo "ERROR: No ramdisk directory after unpack"
+          sudo ls -la
+          exit 1
+        fi
+
+        sudo ls -la ramdisk/ | head -30
+
+        # 注入属性 (文件属主是 root，必须用 sudo 写)
+        CODENAME="${{ github.event.inputs.DEVICE_CODENAME }}"
+        PATCHED=0
+
+        for fname in prop.default build.prop; do
+          if sudo test -f "ramdisk/$fname"; then
+            echo "Patching ramdisk/$fname"
+            sudo bash -c "printf '\nro.product.system.device=%s\nro.product.system.model=%s\nro.product.system.name=%s\n' '$CODENAME' '$CODENAME' '$CODENAME' >> 'ramdisk/$fname'"
+            PATCHED=1
+          fi
+        done
+
+        if [ "$PATCHED" = "0" ]; then
+          echo "No prop files in ramdisk root, searching recursively..."
+          sudo find ramdisk -name "prop.default" -o -name "build.prop" | while read f; do
+            echo "Patching $f"
+            sudo bash -c "printf '\nro.product.system.device=%s\nro.product.system.model=%s\nro.product.system.name=%s\n' '$CODENAME' '$CODENAME' '$CODENAME' >> '$f'"
           done
         fi
 
         # 重新打包
-        ./repackimg.sh
+        sudo ./repackimg.sh || true
 
-        # 将新镜像移动到上层目录
-        mv image-new.img ../patched.img
+        # AIK 产出的 image-new.img 属于 root
+        if sudo test -f image-new.img; then
+          sudo mv image-new.img ../patched.img
+          sudo chown "$(id -u):$(id -g)" ../patched.img
+          echo "OK: patched.img created ($(stat -c%s ../patched.img) bytes)"
+        else
+          echo "WARN: image-new.img not found after repack; will fall back to original"
+        fi
         cd ..
 
+    - name: Create patch script for twrpdtgen fallback
+      run: |
+        cat > patch_and_run.py << 'PYEOF'
+        import os
+        import sys
+
+        # Monkey-patch: 属性缺失时不抛异常，用环境变量兜底
+        import sebaubuntu_libs.libandroid.device_info as di
+
+        _original = di.DeviceInfo.get_first_prop
+
+        def patched(self, props):
+            try:
+                return _original(self, props)
+            except AssertionError:
+                default = os.environ.get('TWRP_DEVICE_CODENAME', 'unknown')
+                print(f'[PATCH] Property {props[0]} missing, using default: {default}')
+                return default
+
+        di.DeviceInfo.get_first_prop = patched
+
+        from twrpdtgen.__main__ import main
+        sys.argv = ['twrpdtgen', '-o', 'device_tree_output', sys.argv[1]]
+        main()
+        PYEOF
+
     - name: Generate device tree
+      env:
+        TWRP_DEVICE_CODENAME: ${{ github.event.inputs.DEVICE_CODENAME }}
       run: |
         mkdir -p device_tree_output
-        python3 -m twrpdtgen \
-          -o device_tree_output \
-          patched.img
+        # 优先用打过补丁的镜像；失败则回退到原始镜像
+        if [ -f patched.img ]; then
+          echo "Using patched.img..."
+          if python3 patch_and_run.py patched.img; then
+            exit 0
+          fi
+          echo "Patched image failed, falling back to original..."
+        fi
+        python3 patch_and_run.py original.img || true
+        echo "=== Output directory contents ==="
+        ls -la device_tree_output/ || true
+        find device_tree_output -type f 2>/dev/null | head -30
 
     - name: Compress device tree
+      if: hashFiles('device_tree_output/**') != ''
       run: |
         cd device_tree_output
         zip -r ../DeviceTree_${{ github.run_number }}.zip .
         cd ..
 
     - name: Create release with device tree
+      if: hashFiles('DeviceTree_*.zip') != ''
       uses: softprops/action-gh-release@v1
       with:
         files: DeviceTree_${{ github.run_number }}.zip
