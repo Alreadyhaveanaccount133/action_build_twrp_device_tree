@@ -8,19 +8,23 @@ on:
         required: true
         default: 'Twrp_Device_Generator'
       IMG_URL:
-        description: 'URL to recovery/boot image'
+        description: 'URL to recovery/boot/vendor_boot image'
         required: true
         default: 'https://github.com/momo54181/action_build_twrp_device_tree/raw/main/recovery.img'
+      DEVICE_CODENAME:
+        description: 'Device codename (e.g., beryl)'
+        required: true
+        default: 'beryl'
 
 jobs:
   generate-device-tree:
     if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Set up environment
       run: |
         sudo apt-get update
@@ -30,30 +34,74 @@ jobs:
           cpio \
           wget \
           zip \
-          unzip
-        
+          unzip \
+          git \
+          file \
+          gzip \
+          lz4 \
+          xz-utils \
+          android-sdk-libsparse-utils
+
     - name: Install TWRP generator
       run: |
         pip3 install --upgrade twrpdtgen
-        
-    - name: Download recovery image
+
+    - name: Download image
       run: |
-        wget -O recovery.img "${{ github.event.inputs.IMG_URL }}"
-        file recovery.img || true  # Display file info for debugging
-      
+        wget -O original.img "${{ github.event.inputs.IMG_URL }}"
+        file original.img || true
+
+    - name: Clone AIK
+      run: |
+        git clone https://github.com/SebaUbuntu/AIK-Linux-mirror.git aik
+        cd aik
+        chmod +x unpackimg.sh repackimg.sh
+
+    - name: Unpack, patch and repack image
+      run: |
+        cd aik
+        # 解包镜像
+        ./unpackimg.sh ../original.img
+
+        # 查找并修改 prop.default 或 build.prop
+        if [ -f ramdisk/prop.default ]; then
+          echo "ro.product.system.device=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/prop.default
+          echo "ro.product.system.model=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/prop.default
+          echo "ro.product.system.name=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/prop.default
+        elif [ -f ramdisk/build.prop ]; then
+          echo "ro.product.system.device=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/build.prop
+          echo "ro.product.system.model=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/build.prop
+          echo "ro.product.system.name=${{ github.event.inputs.DEVICE_CODENAME }}" >> ramdisk/build.prop
+        else
+          echo "未找到 prop.default 或 build.prop，尝试查找所有 build.prop 文件..."
+          find ramdisk -name "build.prop" -o -name "prop.default" | while read f; do
+            echo "添加属性到 $f"
+            echo "ro.product.system.device=${{ github.event.inputs.DEVICE_CODENAME }}" >> "$f"
+            echo "ro.product.system.model=${{ github.event.inputs.DEVICE_CODENAME }}" >> "$f"
+            echo "ro.product.system.name=${{ github.event.inputs.DEVICE_CODENAME }}" >> "$f"
+          done
+        fi
+
+        # 重新打包
+        ./repackimg.sh
+
+        # 将新镜像移动到上层目录
+        mv image-new.img ../patched.img
+        cd ..
+
     - name: Generate device tree
       run: |
         mkdir -p device_tree_output
         python3 -m twrpdtgen \
           -o device_tree_output \
-          recovery.img
-        
+          patched.img
+
     - name: Compress device tree
       run: |
         cd device_tree_output
         zip -r ../DeviceTree_${{ github.run_number }}.zip .
         cd ..
-        
+
     - name: Create release with device tree
       uses: softprops/action-gh-release@v1
       with:
@@ -64,5 +112,6 @@ jobs:
           Automatically generated TWRP device tree
           Build run: ${{ github.run_number }}
           Source image: ${{ github.event.inputs.IMG_URL }}
+          Device codename: ${{ github.event.inputs.DEVICE_CODENAME }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
